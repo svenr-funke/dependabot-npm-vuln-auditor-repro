@@ -55,3 +55,33 @@ js-yaml security job carries **nine** advisory entries spanning three majors
 (`< 2.0.5` … `>= 3.0.0 < 3.15.0` … `>= 4.0.0 < 4.3.0` … `>= 5.0.0 <= 5.2.1`), while
 `@babel/core` has a single-range advisory. See the job-definition JSON at the top of any
 failing run log.
+
+## Root-cause isolation: the updater proxy
+
+`auditor-replica.mjs` re-runs the exact audit the updater performs:
+[dependabot-core's `vulnerability-auditor.ts`](https://github.com/dependabot/dependabot-core/blob/main/npm_and_yarn/helpers/lib/npm/vulnerability-auditor.ts)
+logic — a local HTTP server serving the failing job's **exact** nine-advisory payload as
+the `auditRegistry`, then `Arborist#audit()` on this repo's tree.
+
+Run inside the **exact updater image** of the failing jobs, with the image's own
+`@npmcli/arborist@9.4.0`, against the real npm registry:
+
+```
+$ docker run --rm \
+    -v "$PWD/auditor-replica.mjs:/opt/npm_and_yarn/replica.mjs:ro" -v "$PWD:/repro:ro" \
+    --entrypoint sh ghcr.io/dependabot/dependabot-updater-npm:88be12612b25d5a164d14d15a2f4ae56e9f4e486 \
+    -c 'cd /opt/npm_and_yarn && node replica.mjs /repro'
+fixAvailable: true
+range (computed vulnerable range): >= 3.0.0 < 3.15.0 || < 3.15.0
+```
+
+Also `fixAvailable: true` on Arborist 9.4.0–9.9.1 outside the image. The audit code
+computes the fix correctly whenever it sees real registry data — the only component of the
+failing jobs not present in this replica is the **Dependabot update-job proxy** that all
+registry traffic is routed through.
+
+Consistent detail: js-yaml's fixed versions (3.15.0 / 4.3.0) were published **2026-06-26**;
+@babel/core's fix (7.29.6) on **2026-05-25**. A stale proxied packument snapshot from
+between those dates would make exactly js-yaml unfixable (every version satisfying
+`^3.13.1` would be `< 3.15.0`, hence vulnerable) while leaving @babel/core fixable — which
+is precisely the observed split.
